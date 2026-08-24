@@ -1,0 +1,4 @@
+# Il plugin ciclo ha zero dipendenze runtime oltre Node/git/jq: niente node_modules.
+node_modules/
+.DS_Store
+*.log

@@ -1,0 +1,7 @@
+{
+  "name": "ciclo",
+  "version": "0.1.0",
+  "description": "ciclo — pianificazione blueprint-first (BOOTSTRAP di Trueline) + loop di build autonomo: un macrotask per sessione Claude Code nuova, oracoli deterministici (exit code), commit condizionato al verde. Delega build e test alle skill di ecosistema installate nel progetto. Senza la batteria di security review di Trueline (niente BUILD/REMEDIATE).",
+  "author": { "name": "claudiosnivel-dot" },
+  "license": "MIT"
+}

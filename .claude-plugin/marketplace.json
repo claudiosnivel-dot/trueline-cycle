@@ -1,0 +1,12 @@
+{
+  "name": "ciclo",
+  "description": "Marketplace auto-ospitato del plugin ciclo: pianificazione blueprint-first + loop di build autonomo.",
+  "owner": { "name": "claudiosnivel-dot" },
+  "plugins": [
+    {
+      "name": "ciclo",
+      "source": "./",
+      "description": "Pianificazione blueprint-first + loop di build autonomo, un macrotask per sessione, oracoli deterministici. Delega build/test alle skill di ecosistema del progetto."
+    }
+  ]
+}
