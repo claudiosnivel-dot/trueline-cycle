@@ -16,6 +16,10 @@ Funziona anche fuori dall'ecosistema Trueline (es. un'app iOS in Swift): la
 conoscenza di *come si builda e si testa* uno stack la portano le **skill di
 ecosistema installate nel progetto**; `ciclo` orchestra e delega.
 
+> 📖 **Guida pratica dettagliata (IT + EN):** [`docs/GUIDE.md`](docs/GUIDE.md) —
+> installazione, il flusso in 4 fasi, esempi (iOS/Swift e manuale), riferimento
+> completo di `.cycle/config.sh`, oracoli, log, FAQ.
+
 ## Requisiti
 
 - **Node** (solo built-in, nessun `npm install`), **git**, **jq**.
