@@ -1,0 +1,247 @@
+#!/usr/bin/env bash
+# ciclo — driver del loop di build (§6).
+#
+# Gira NEL TERMINALE, fuori da una sessione interattiva (D-002): ogni macrotask
+# della coda apre un processo `claude -p` NUOVO. Nessun /clear: il clear è
+# eliminato, non automatizzato. La continuità passa da SESSION-STATE.md (D-003).
+#
+# Per ogni macrotask:
+#   1. apre una sessione (claude -p --output-format json), cattura session_id
+#   2. gate umano prima del build (GATE=1, saltabile con --no-gate)
+#   3. build via `claude -r <sid> -p`
+#   4. esegue gli oracoli; se rossi rimanda a Claude l'OUTPUT GREZZO e ritenta
+#      fino a MAX_FIX_ATTEMPTS
+#   5. commit (e push se GIT_PUSH=1) SOLO a oracoli verdi (D-001)
+#   6. prompt di fine sessione: aggiorna SESSION-STATE.md
+#   7. fine processo; il macrotask successivo apre una sessione nuova
+#
+# Un macrotask fallito NON ferma la coda, ma il driver esce non-zero se almeno
+# uno è fallito.
+#
+# Dipendenze: bash, node (built-in), jq, git. Nessun npm install (D-006).
+#
+# Seam di test: CICLO_CLAUDE_BIN sovrascrive il binario "claude" (per test e per
+# override avanzati). Default: claude.
+
+set -euo pipefail
+
+# ── risoluzione del percorso del plugin (lo script può essere un symlink) ─────
+resolve_self() {
+  local src="$1"
+  while [ -h "$src" ]; do
+    local dir; dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    case "$src" in /*) ;; *) src="$dir/$src";; esac
+  done
+  printf '%s\n' "$src"
+}
+SELF="$(resolve_self "${BASH_SOURCE[0]}")"
+PLUGIN_ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
+ADAPTER="$PLUGIN_ROOT/bin/ciclo-queue.mjs"
+VALIDATE="$PLUGIN_ROOT/scripts/blueprint/validate_blueprint.mjs"
+CLAUDE_BIN="${CICLO_CLAUDE_BIN:-claude}"
+
+# ── flag ──────────────────────────────────────────────────────────────────────
+DRY_RUN=0; NO_GATE=0
+usage() {
+  cat <<'EOF'
+Uso: ciclo [--dry-run] [--no-gate] [-h]
+
+  --dry-run   Percorre l'intero flusso senza chiamare Claude, senza eseguire
+              gli oracoli e senza committare. Mostra la coda e i passi previsti.
+  --no-gate   Non chiede conferma umana prima di ogni build (esecuzione autonoma).
+  -h, --help  Questo aiuto.
+
+Legge .cycle/config.sh dalla root del progetto (crealo con /ciclo:setup).
+Log per run in .cycle/logs/<timestamp>/.
+EOF
+}
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1 ;;
+    --no-gate) NO_GATE=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "ciclo: flag sconosciuto: $1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+# ── dipendenze ────────────────────────────────────────────────────────────────
+for dep in node jq git; do
+  command -v "$dep" >/dev/null 2>&1 || { echo "ciclo: manca la dipendenza '$dep'" >&2; exit 2; }
+done
+
+# ── progetto + config ─────────────────────────────────────────────────────────
+PROJECT_ROOT="$(pwd)"
+CONFIG="$PROJECT_ROOT/.cycle/config.sh"
+[ -f "$CONFIG" ] || { echo "ciclo: manca .cycle/config.sh — esegui /ciclo:setup" >&2; exit 2; }
+# shellcheck disable=SC1090
+source "$CONFIG"
+
+SOURCE="${SOURCE:-}"
+BLUEPRINT_DIR="${BLUEPRINT_DIR:-blueprint}"
+SESSION_STATE="${SESSION_STATE:-SESSION-STATE.md}"
+TEST_CMD="${TEST_CMD:-}"
+GATE="${GATE:-1}"
+GIT_PUSH="${GIT_PUSH:-0}"
+MAX_FIX_ATTEMPTS="${MAX_FIX_ATTEMPTS:-3}"
+ECOSYSTEM="${ECOSYSTEM:-}"
+[ "$NO_GATE" = 1 ] && GATE=0
+
+# ── run dir ───────────────────────────────────────────────────────────────────
+TS="$(date +%Y%m%d-%H%M%S)"
+RUNDIR="$PROJECT_ROOT/.cycle/logs/$TS"
+mkdir -p "$RUNDIR"
+QUEUE="$RUNDIR/queue.json"
+log() { echo "[ciclo] $*"; }
+
+# ── costruzione della coda via adapter (D-005) ────────────────────────────────
+if [ "$SOURCE" = manual ]; then
+  ORA_FILE="$RUNDIR/oracles.manual.txt"
+  printf '%s\n' "${ORACLES[@]:-}" > "$ORA_FILE"
+  node "$ADAPTER" --source manual \
+    --tasks-file "$PROJECT_ROOT/.cycle/tasks.txt" \
+    --oracles-file "$ORA_FILE" > "$QUEUE"
+elif [ "$SOURCE" = trueline ]; then
+  node "$ADAPTER" --source trueline \
+    --blueprint-dir "$PROJECT_ROOT/$BLUEPRINT_DIR" \
+    --test-cmd "$TEST_CMD" \
+    --validate-script "$VALIDATE" > "$QUEUE"
+else
+  echo "ciclo: SOURCE non valido in config: '$SOURCE' (attesi: trueline | manual)" >&2
+  exit 2
+fi
+
+# ── gate zero: se la coda non è pronta, il loop NON parte ─────────────────────
+if [ "$(jq -r '.ok' "$QUEUE")" != true ]; then
+  log "La coda non è pronta: il loop non parte."
+  if [ "$(jq -r '.gate // empty' "$QUEUE")" = validate_blueprint ]; then
+    log "GATE ZERO fallito — validate_blueprint (exit $(jq -r '.exit' "$QUEUE")). Report:"
+    echo "----------------------------------------------------------------"
+    jq -r '.report' "$QUEUE"
+    echo "----------------------------------------------------------------"
+  else
+    log "Errore: $(jq -r '.error // "sconosciuto"' "$QUEUE")"
+  fi
+  exit 1
+fi
+
+N="$(jq -r '.queue | length' "$QUEUE")"
+log "Coda pronta: $N macrotask (SOURCE=$SOURCE). Log: $RUNDIR"
+
+# ── prompt di lifecycle (emessi da /ciclo:blueprint, se presenti) ─────────────
+SS_PROMPT_FILE="$PROJECT_ROOT/.cycle/prompts/session-start.md"
+SE_PROMPT_FILE="$PROJECT_ROOT/.cycle/prompts/session-end.md"
+
+# ── esecuzione oracoli di un macrotask: 0 = tutti verdi, 1 = almeno uno rosso ──
+run_oracles() { # $1 = indice macrotask, $2 = logfile
+  local idx="$1" lf="$2" o n j allok=0
+  : > "$lf"
+  n="$(jq -r ".queue[$idx].oracles | length" "$QUEUE")"
+  for j in $(seq 0 $((n-1))); do
+    o="$(jq -r ".queue[$idx].oracles[$j]" "$QUEUE")"
+    { echo "### oracolo: $o"; } >> "$lf"
+    if ( cd "$PROJECT_ROOT" && bash -c "$o" ) >> "$lf" 2>&1; then
+      echo "### exit 0 (verde)" >> "$lf"
+    else
+      echo "### exit non-zero (rosso)" >> "$lf"
+      allok=1
+    fi
+  done
+  return $allok
+}
+
+export CICLO_DRIVER=1   # l'hook SessionStart salta l'iniezione: il contesto è nel prompt
+
+FAILED=0
+for i in $(seq 0 $((N-1))); do
+  MT="$(jq -r ".queue[$i].macrotask" "$QUEUE")"
+  MT_TASKS="$(jq -r ".queue[$i].tasks | join(\", \")" "$QUEUE")"
+  slug="$(printf '%s' "$MT" | tr ' /' '__' | tr -cd 'A-Za-z0-9_-')"
+  MDIR="$RUNDIR/$(printf '%02d' "$i")-$slug"
+  mkdir -p "$MDIR"
+  log "── Macrotask $((i+1))/$N: $MT ──"
+
+  # gate umano
+  if [ "$GATE" = 1 ] && [ "$DRY_RUN" = 0 ]; then
+    if [ -e /dev/tty ]; then
+      printf '[ciclo] Costruire il macrotask "%s"? [y/N] ' "$MT" > /dev/tty
+      read -r ans < /dev/tty || ans=""
+      case "$ans" in y|Y|s|S) ;; *) log "saltato dall'utente"; continue ;; esac
+    else
+      echo "ciclo: GATE attivo ma nessun /dev/tty: usa --no-gate per l'esecuzione autonoma." >&2
+      exit 2
+    fi
+  fi
+
+  # dry-run: mostra i passi, niente Claude / oracoli / commit
+  if [ "$DRY_RUN" = 1 ]; then
+    log "[dry-run] aprirei una sessione claude nuova, build, oracoli, commit-se-verde"
+    log "[dry-run] task: ${MT_TASKS:-(n/d)}"
+    log "[dry-run] oracoli previsti:"
+    jq -r ".queue[$i].oracles[]" "$QUEUE" | sed 's/^/           · /'
+    continue
+  fi
+
+  # 1. apre la sessione, cattura session_id
+  START_PROMPT="$( { [ -f "$SS_PROMPT_FILE" ] && cat "$SS_PROMPT_FILE"; echo; \
+    echo "## Macrotask corrente: $MT"; \
+    echo "Task atomici: ${MT_TASKS:-(vedi coda)}"; \
+    echo "Leggi $SESSION_STATE per lo stato vivo, poi costruisci SOLO questo macrotask. Non modificare i test."; } )"
+  "$CLAUDE_BIN" -p --output-format json "$START_PROMPT" > "$MDIR/session.json" 2> "$MDIR/session.err" || true
+  SID="$(jq -r '.session_id // empty' "$MDIR/session.json" 2>/dev/null || true)"
+  if [ -z "$SID" ]; then
+    log "impossibile ottenere session_id (vedi $MDIR/session.json / session.err) — macrotask fallito"
+    FAILED=1
+    continue
+  fi
+  log "sessione aperta: $SID"
+
+  # 3. build
+  BUILD_PROMPT="Costruisci il macrotask \"$MT\" (${MT_TASKS:-vedi coda}) secondo il blueprint. Implementa il codice necessario a far passare i suoi target_tests. Non modificare i test."
+  "$CLAUDE_BIN" -r "$SID" -p "$BUILD_PROMPT" > "$MDIR/build.log" 2>&1 || true
+
+  # 4. oracoli + retry con OUTPUT GREZZO
+  green=0
+  run_oracles "$i" "$MDIR/oracles.attempt-0.log" && green=1
+  attempt=0
+  while [ "$green" = 0 ] && [ "$attempt" -lt "$MAX_FIX_ATTEMPTS" ]; do
+    attempt=$((attempt+1))
+    log "oracoli ROSSI — tentativo di fix $attempt/$MAX_FIX_ATTEMPTS"
+    RAW="$(cat "$MDIR/oracles.attempt-$((attempt-1)).log")"
+    "$CLAUDE_BIN" -r "$SID" -p "Gli oracoli sono falliti. Ecco l'OUTPUT GREZZO, non un riassunto:
+
+$RAW
+
+Correggi il codice perché passino. Non modificare i test." > "$MDIR/fix-$attempt.log" 2>&1 || true
+    run_oracles "$i" "$MDIR/oracles.attempt-$attempt.log" && green=1
+  done
+
+  # 5. commit SOLO a verde
+  if [ "$green" = 1 ]; then
+    log "oracoli VERDI"
+    if ( cd "$PROJECT_ROOT" && git add -A && git commit -q -m "ciclo: macrotask $MT (${MT_TASKS:-})" ); then
+      log "commit creato"
+      if [ "$GIT_PUSH" = 1 ]; then
+        ( cd "$PROJECT_ROOT" && git push ) && log "push eseguito" || log "push non riuscito"
+      fi
+    else
+      log "git commit non ha prodotto nulla (working tree pulito?)"
+    fi
+  else
+    log "oracoli ancora ROSSI dopo $MAX_FIX_ATTEMPTS tentativi — NIENTE commit"
+    FAILED=1
+  fi
+
+  # 6. prompt di fine sessione: aggiorna SESSION-STATE
+  END_PROMPT="$( { [ -f "$SE_PROMPT_FILE" ] && cat "$SE_PROMPT_FILE"; echo; \
+    echo "Aggiorna $SESSION_STATE per il macrotask \"$MT\": esito oracoli e stato git. Non scrivere altro codice."; } )"
+  "$CLAUDE_BIN" -r "$SID" -p "$END_PROMPT" > "$MDIR/session-end.log" 2>&1 || true
+  # 7. fine processo: il prossimo macrotask aprirà una sessione nuova
+done
+
+if [ "$FAILED" != 0 ]; then
+  log "Run terminato: almeno un macrotask è fallito."
+  exit 1
+fi
+log "Run terminato: tutti i macrotask verdi."

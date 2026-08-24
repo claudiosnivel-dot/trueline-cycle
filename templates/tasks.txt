@@ -1,0 +1,8 @@
+# .cycle/tasks.txt — coda manuale (SOURCE=manual).
+# Una riga = un'unità di lavoro (un "macrotask") che il loop costruisce in una
+# sessione dedicata. Righe vuote e righe che iniziano con # sono ignorate.
+#
+# Esempio (cancella queste righe e metti le tue):
+# Schermata di login con validazione
+# Lista prenotazioni con pull-to-refresh
+# Sincronizzazione offline
